@@ -31,6 +31,7 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
+from hermes_constants import get_hermes_home
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -137,6 +138,29 @@ _MIN_SPAWN_DEPTH = 1
 _MAX_SPAWN_DEPTH_CAP = 3
 
 
+def _load_profile_config(profile_name: str) -> Optional[dict]:
+    """Load a profile config.yaml and return model/provider settings."""
+    import yaml
+    profile_dir = get_hermes_home() / "profiles" / profile_name
+    config_path = profile_dir / "config.yaml"
+    if not config_path.exists():
+        return None
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f) or {}
+    model_info = cfg.get("model") or {}
+    return {
+        "model": model_info.get("default"),
+        "provider": model_info.get("provider"),
+        "api_mode": model_info.get("api_mode"),
+        "base_url": model_info.get("base_url"),
+    }
+
+def _load_profile_soul(profile_name: str) -> Optional[str]:
+    """Load a profile SOUL.md for use as system prompt."""
+    soul_path = get_hermes_home() / "profiles" / profile_name / "SOUL.md"
+    if not soul_path.exists():
+        return None
+    return soul_path.read_text(encoding="utf-8")
 # ---------------------------------------------------------------------------
 # Runtime state: pause flag + active subagent registry
 #
@@ -572,6 +596,8 @@ def _build_child_system_prompt(
     *,
     workspace_path: Optional[str] = None,
     role: str = "leaf",
+    # Profile system prompt override
+    profile_system_prompt: Optional[str] = None,
     max_spawn_depth: int = 2,
     child_depth: int = 1,
 ) -> str:
@@ -968,14 +994,17 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
-    child_prompt = _build_child_system_prompt(
-        goal,
-        context,
-        workspace_path=workspace_hint,
-        role=effective_role,
-        max_spawn_depth=max_spawn,
-        child_depth=child_depth,
-    )
+    if profile_system_prompt:
+        child_prompt = profile_system_prompt
+    else:
+        child_prompt = _build_child_system_prompt(
+            goal,
+            context,
+            workspace_path=workspace_hint,
+            role=effective_role,
+            max_spawn_depth=max_spawn,
+            child_depth=child_depth,
+        )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -1924,6 +1953,7 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    profile: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -1937,6 +1967,9 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The 'profile' parameter selects a defined Hermes profile whose
+    model, provider, and SOUL.md persona are applied to the child.
 
     Returns JSON with results array, one entry per task.
     """
@@ -1996,6 +2029,23 @@ def delegate_task(
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+
+    # Resolve profile -> model/provider/persona override
+    profile_model: Optional[str] = None
+    profile_provider: Optional[str] = None
+    profile_soul: Optional[str] = None
+    if profile:
+        profile_cfg = _load_profile_config(profile)
+        if profile_cfg:
+            profile_model = profile_cfg.get('model')
+            profile_provider = profile_cfg.get('provider')
+            profile_soul = _load_profile_soul(profile)
+        else:
+            logger.warning(
+                'delegate_task: profile %s not found in %s/profiles/; '
+                'ignoring profile override',
+                profile, get_hermes_home()
+            )
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2058,28 +2108,34 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+
+            # Profile overrides: profile param beats delegation config
+            effective_model = profile_model or creds["model"]
+            effective_provider = profile_provider or creds.get('provider')
+
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                model=effective_model,
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
+                override_provider=effective_provider,
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
                 override_acp_command=t.get("acp_command")
                 or acp_command
-                or creds.get("command"),
+                or creds.get('command'),
                 override_acp_args=(
                     task_acp_args
                     if task_acp_args is not None
-                    else (acp_args if acp_args is not None else creds.get("args"))
+                    else (acp_args if acp_args is not None else creds.get('args'))
                 ),
                 role=effective_role,
+                profile_system_prompt=profile_soul,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2771,6 +2827,13 @@ DELEGATE_TASK_SCHEMA = {
                     "Leave empty unless acp_command is explicitly provided."
                 ),
             },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Name of a defined Hermes profile (e.g. 'reese', 'desi') "
+                    "that controls model, provider, and SOUL.md persona."
+                ),
+            },
         },
         "required": [],
     },
@@ -2793,6 +2856,7 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        profile=args.get("profile"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
