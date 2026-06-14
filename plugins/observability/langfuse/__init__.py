@@ -744,6 +744,8 @@ def on_pre_llm_request(
     approx_input_tokens: int = 0,
     request_char_count: int = 0,
     max_tokens: Any = None,
+    temperature: Any = None,
+    top_p: Any = None,
     conversation_history: Any = None,
     user_message: Any = None,
     **_: Any,
@@ -794,17 +796,36 @@ def on_pre_llm_request(
                 "base_url": base_url,
             },
             model=model,
-            model_parameters={"api_mode": api_mode, "provider": provider},
+            model_parameters={
+                "api_mode": api_mode,
+                "provider": provider,
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_tokens": max_tokens,
+            },
         )
 
 
-def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str = "", base_url: str = "",
-                     api_mode: str = "", model: str = "", api_call_count: int = 0,
-                     assistant_message: Any = None, response: Any = None,
-                     api_duration: float = 0.0, finish_reason: str = "",
-                     usage: Any = None, assistant_content_chars: int = 0,
-                     assistant_tool_call_count: int = 0, assistant_response: Any = None,
-                     **_: Any) -> None:
+def on_post_llm_call(
+    *,
+    task_id: str = "",
+    session_id: str = "",
+    provider: str = "",
+    base_url: str = "",
+    api_mode: str = "",
+    model: str = "",
+    api_call_count: int = 0,
+    assistant_message: Any = None,
+    assistant_reasoning: Any = None,
+    response: Any = None,
+    api_duration: float = 0.0,
+    finish_reason: str = "",
+    usage: Any = None,
+    assistant_content_chars: int = 0,
+    assistant_tool_call_count: int = 0,
+    assistant_response: Any = None,
+    **_: Any,
+) -> None:
     client = _get_langfuse()
     if client is None:
         return
@@ -824,14 +845,21 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
     if assistant_message is not None:
         output = _serialize_assistant_message(assistant_message)
     elif assistant_response is not None:
-        # post_llm_call passes assistant_response as a plain string
-        output = {"content": _safe_value(assistant_response), "reasoning": None, "tool_calls": []}
+        # post_llm_call passes assistant_response as a plain string.
+        # Extract reasoning from the hook parameter if available.
+        output = {
+            "content": _safe_value(assistant_response),
+            "reasoning": _safe_value(assistant_reasoning),
+            "tool_calls": [],
+        }
     else:
-        # post_api_request path — reconstruct from summary kwargs
+        # post_api_request path — reconstruct from summary kwargs.
         output = {
             "content": f"[{assistant_content_chars} chars]" if assistant_content_chars else None,
-            "reasoning": None,
-            "tool_calls": [{"id": f"tc_{i}"} for i in range(assistant_tool_call_count)] if assistant_tool_call_count else [],
+            "reasoning": _safe_value(assistant_reasoning),
+            "tool_calls": [{"id": f"tc_{i}"} for i in range(assistant_tool_call_count)]
+            if assistant_tool_call_count
+            else [],
         }
 
     if output.get("tool_calls"):

@@ -1228,6 +1228,8 @@ def run_conversation(
                         approx_input_tokens=approx_tokens,
                         request_char_count=total_chars,
                         max_tokens=agent.max_tokens,
+                        temperature=api_kwargs.get("temperature"),
+                        top_p=api_kwargs.get("top_p"),
                     )
                 except Exception:
                     pass
@@ -4462,6 +4464,16 @@ def run_conversation(
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
+    # Extract reasoning from the CURRENT turn before hooks fire.
+    # Walk backwards but stop at the user message that started this turn.
+    _reasoning_for_hook = None
+    for _rm in reversed(messages):
+        if _rm.get("role") == "user":
+            break
+        if _rm.get("role") == "assistant" and _rm.get("reasoning"):
+            _reasoning_for_hook = _rm["reasoning"]
+            break
+
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
@@ -4474,6 +4486,7 @@ def run_conversation(
                 session_id=agent.session_id,
                 user_message=original_user_message,
                 assistant_response=final_response,
+                assistant_reasoning=_reasoning_for_hook,
                 conversation_history=list(messages),
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
@@ -4481,22 +4494,10 @@ def run_conversation(
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
 
-    # Extract reasoning from the CURRENT turn only.  Walk backwards
-    # but stop at the user message that started this turn — anything
-    # earlier is from a prior turn and must not leak into the reasoning
-    # box (confusing stale display; #17055).  Within the current turn
-    # we still want the *most recent* non-empty reasoning: many
-    # providers (Claude thinking, DeepSeek v4, Codex Responses) emit
-    # reasoning on the tool-call step and leave the final-answer step
-    # with reasoning=None, so picking only the last assistant would
-    # silently drop legitimate same-turn reasoning.
-    last_reasoning = None
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            break  # turn boundary — don't cross into prior turns
-        if msg.get("role") == "assistant" and msg.get("reasoning"):
-            last_reasoning = msg["reasoning"]
-            break
+    # Extract reasoning from the CURRENT turn only — but we already
+    # did that above for the hook.  Walk backwards again for the
+    # display / result dict.
+    last_reasoning = _reasoning_for_hook
 
     # Build result with interrupt info if applicable
     result = {
