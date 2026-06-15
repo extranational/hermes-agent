@@ -139,20 +139,40 @@ _MAX_SPAWN_DEPTH_CAP = 3
 
 
 def _load_profile_config(profile_name: str) -> Optional[dict]:
-    """Load a profile config.yaml and return model/provider settings."""
+    """Load a profile config.yaml and return model/provider/generation settings.
+
+    Returns every setting a child agent needs to fully inherit a profile's
+    identity and runtime behaviour:
+      - routing: model / provider / api_mode / base_url (from the ``model:`` block)
+      - generation: temperature / top_p / max_tokens (from the ``model:`` block;
+        absent in most profiles, in which case the provider/model defaults apply)
+      - reasoning: reasoning_effort (from the ``agent:`` block — matches the
+        canonical ``agent.reasoning_effort`` path used elsewhere in Hermes)
+
+    A value not present in the profile is returned as None so callers can fall
+    back to delegation-config / parent inheritance without ambiguity.
+    """
     import yaml
     profile_dir = get_hermes_home() / "profiles" / profile_name
     config_path = profile_dir / "config.yaml"
     if not config_path.exists():
         return None
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     model_info = cfg.get("model") or {}
+    agent_info = cfg.get("agent") or {}
     return {
         "model": model_info.get("default"),
         "provider": model_info.get("provider"),
         "api_mode": model_info.get("api_mode"),
         "base_url": model_info.get("base_url"),
+        # Generation params live in the ``model:`` block; fall back to any
+        # top-level key for forward-compat. Usually absent (provider defaults).
+        "temperature": model_info.get("temperature", cfg.get("temperature")),
+        "top_p": model_info.get("top_p", cfg.get("top_p")),
+        "max_tokens": model_info.get("max_tokens", cfg.get("max_tokens")),
+        # Reasoning effort is configured under ``agent.reasoning_effort``.
+        "reasoning_effort": agent_info.get("reasoning_effort"),
     }
 
 def _load_profile_soul(profile_name: str) -> Optional[str]:
@@ -914,6 +934,15 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Profile-based delegation overrides (delegate_task(profile=...)). When set,
+    # the child fully inherits the named profile's persona and runtime settings
+    # instead of the parent's. All optional; None means "fall back to the
+    # delegation-config / parent-inherit path as before".
+    profile_system_prompt: Optional[str] = None,
+    override_temperature: Optional[float] = None,
+    override_top_p: Optional[float] = None,
+    override_max_tokens: Optional[int] = None,
+    override_reasoning_effort: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -994,17 +1023,19 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
-    if profile_system_prompt:
-        child_prompt = profile_system_prompt
-    else:
-        child_prompt = _build_child_system_prompt(
-            goal,
-            context,
-            workspace_path=workspace_hint,
-            role=effective_role,
-            max_spawn_depth=max_spawn,
-            child_depth=child_depth,
-        )
+    # The focused-subagent scaffolding (YOUR TASK / CONTEXT / summary rules) is
+    # ALWAYS the ephemeral layer. For profile delegation the profile's SOUL.md is
+    # passed separately as the base *identity* (identity_override below) so it
+    # becomes the primary persona instead of being appended after the generic
+    # Hermes identity — while the task scaffolding and tool guidance are kept.
+    child_prompt = _build_child_system_prompt(
+        goal,
+        context,
+        workspace_path=workspace_hint,
+        role=effective_role,
+        max_spawn_depth=max_spawn,
+        child_depth=child_depth,
+    )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -1086,24 +1117,44 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: profile override > delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
-        delegation_effort = str(delegation_cfg.get("reasoning_effort") or "").strip()
-        if delegation_effort:
+        # Profile's agent.reasoning_effort takes precedence over the global
+        # delegation.reasoning_effort so delegate_task(profile=...) honours the
+        # named profile's configured effort (e.g. Larry's "high").
+        effort = str(
+            override_reasoning_effort or delegation_cfg.get("reasoning_effort") or ""
+        ).strip()
+        if effort:
             from hermes_constants import parse_reasoning_effort
 
-            parsed = parse_reasoning_effort(delegation_effort)
+            parsed = parse_reasoning_effort(effort)
             if parsed is not None:
                 child_reasoning = parsed
             else:
                 logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
+                    "Unknown reasoning_effort '%s', inheriting parent level",
+                    effort,
                 )
     except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+        logger.debug("Could not load reasoning_effort: %s", exc)
+
+    # Resolve generation overrides (profile-supplied). temperature/top_p ride on
+    # request_overrides, which the chat-completions transport merges verbatim into
+    # the API payload (api_kwargs.update(overrides)). max_tokens has a first-class
+    # AIAgent param. All fall back to parent inheritance when the profile is silent.
+    child_request_overrides = dict(getattr(parent_agent, "request_overrides", None) or {})
+    if override_temperature is not None:
+        child_request_overrides["temperature"] = override_temperature
+    if override_top_p is not None:
+        child_request_overrides["top_p"] = override_top_p
+    effective_max_tokens = (
+        override_max_tokens
+        if override_max_tokens is not None
+        else getattr(parent_agent, "max_tokens", None)
+    )
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
@@ -1141,13 +1192,15 @@ def _build_child_agent(
         acp_command=effective_acp_command,
         acp_args=effective_acp_args,
         max_iterations=max_iterations,
-        max_tokens=getattr(parent_agent, "max_tokens", None),
+        max_tokens=effective_max_tokens,
         reasoning_config=child_reasoning,
+        request_overrides=(child_request_overrides or None),
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
         fallback_model=parent_fallback,
         enabled_toolsets=child_toolsets,
         quiet_mode=True,
         ephemeral_system_prompt=child_prompt,
+        identity_override=profile_system_prompt,
         log_prefix=f"[subagent-{task_index}]",
         platform=parent_agent.platform,
         skip_context_files=True,
@@ -2030,15 +2083,27 @@ def delegate_task(
     except ValueError as exc:
         return tool_error(str(exc))
 
-    # Resolve profile -> model/provider/persona override
+    # Resolve profile -> model/provider/persona/generation override
     profile_model: Optional[str] = None
     profile_provider: Optional[str] = None
+    profile_api_mode: Optional[str] = None
+    profile_base_url: Optional[str] = None
     profile_soul: Optional[str] = None
+    profile_temperature: Optional[float] = None
+    profile_top_p: Optional[float] = None
+    profile_max_tokens: Optional[int] = None
+    profile_reasoning_effort: Optional[str] = None
     if profile:
         profile_cfg = _load_profile_config(profile)
         if profile_cfg:
             profile_model = profile_cfg.get('model')
             profile_provider = profile_cfg.get('provider')
+            profile_api_mode = profile_cfg.get('api_mode')
+            profile_base_url = profile_cfg.get('base_url')
+            profile_temperature = profile_cfg.get('temperature')
+            profile_top_p = profile_cfg.get('top_p')
+            profile_max_tokens = profile_cfg.get('max_tokens')
+            profile_reasoning_effort = profile_cfg.get('reasoning_effort')
             profile_soul = _load_profile_soul(profile)
         else:
             logger.warning(
@@ -2109,9 +2174,16 @@ def delegate_task(
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
 
-            # Profile overrides: profile param beats delegation config
+            # Profile overrides: profile param beats delegation config. Routing
+            # (model/provider/base_url/api_mode) must all come from the profile
+            # together — propagating only model+provider would leave the child on
+            # the parent's endpoint/API surface (e.g. wrong base_url -> 404).
+            # ``or None`` coerces empty-string config values to None so the
+            # downstream re-derivation path in _build_child_agent still fires.
             effective_model = profile_model or creds["model"]
             effective_provider = profile_provider or creds.get('provider')
+            effective_base_url = profile_base_url or creds["base_url"]
+            effective_api_mode = profile_api_mode or creds["api_mode"] or None
 
             child = _build_child_agent(
                 task_index=i,
@@ -2123,9 +2195,9 @@ def delegate_task(
                 task_count=n_tasks,
                 parent_agent=parent_agent,
                 override_provider=effective_provider,
-                override_base_url=creds["base_url"],
+                override_base_url=effective_base_url,
                 override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
+                override_api_mode=effective_api_mode,
                 override_acp_command=t.get("acp_command")
                 or acp_command
                 or creds.get('command'),
@@ -2136,6 +2208,10 @@ def delegate_task(
                 ),
                 role=effective_role,
                 profile_system_prompt=profile_soul,
+                override_temperature=profile_temperature,
+                override_top_p=profile_top_p,
+                override_max_tokens=profile_max_tokens,
+                override_reasoning_effort=profile_reasoning_effort,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names

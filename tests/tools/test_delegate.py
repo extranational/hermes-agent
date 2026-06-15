@@ -2667,5 +2667,147 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIsNone(kwargs["fallback_model"])
 
 
+class TestProfileDelegation(unittest.TestCase):
+    """delegate_task(profile=...) must fully apply a named profile's settings.
+
+    Regression coverage for the profile-routing bugs: the missing
+    _build_child_agent(profile_system_prompt=...) parameter (a hard TypeError),
+    dropped base_url/api_mode/reasoning_effort, and SOUL.md being appended
+    rather than used as the primary identity.
+    """
+
+    def _write_profile(self, home, name, *, soul="I am Larry.", extra_model=None,
+                       reasoning_effort="high"):
+        import yaml
+        prof_dir = home / "profiles" / name
+        prof_dir.mkdir(parents=True, exist_ok=True)
+        model_block = {
+            "default": "nvidia/nemotron-3-ultra",
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+        if extra_model:
+            model_block.update(extra_model)
+        cfg = {"model": model_block, "agent": {"reasoning_effort": reasoning_effort}}
+        (prof_dir / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        (prof_dir / "SOUL.md").write_text(soul, encoding="utf-8")
+        return prof_dir
+
+    def test_load_profile_config_extracts_all_fields(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            self._write_profile(
+                home, "larry",
+                extra_model={"temperature": 0.7, "top_p": 0.9, "max_tokens": 4096},
+            )
+            with patch("tools.delegate_tool.get_hermes_home", return_value=home):
+                from tools.delegate_tool import _load_profile_config
+                cfg = _load_profile_config("larry")
+        self.assertEqual(cfg["model"], "nvidia/nemotron-3-ultra")
+        self.assertEqual(cfg["provider"], "openrouter")
+        self.assertEqual(cfg["api_mode"], "chat_completions")
+        self.assertEqual(cfg["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(cfg["temperature"], 0.7)
+        self.assertEqual(cfg["top_p"], 0.9)
+        self.assertEqual(cfg["max_tokens"], 4096)
+        self.assertEqual(cfg["reasoning_effort"], "high")
+
+    def test_build_child_agent_accepts_profile_system_prompt(self):
+        """Regression: the missing parameter raised
+        'TypeError: _build_child_agent() got an unexpected keyword argument
+        'profile_system_prompt'' and broke ALL profile delegation."""
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            try:
+                _build_child_agent(
+                    task_index=0,
+                    goal="do the thing",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                    profile_system_prompt="I am Larry.",
+                    override_reasoning_effort="high",
+                )
+            except TypeError as exc:
+                self.fail(f"_build_child_agent rejected profile kwargs: {exc}")
+        _, kwargs = MockAgent.call_args
+        # SOUL goes to identity_override (primary identity), NOT ephemeral.
+        self.assertEqual(kwargs["identity_override"], "I am Larry.")
+
+    def test_profile_routes_all_settings_to_child(self):
+        import tempfile
+        from pathlib import Path
+        from hermes_constants import parse_reasoning_effort
+
+        parent = _make_mock_parent(depth=0)
+        parent.request_overrides = {}
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            self._write_profile(
+                home, "larry", soul="I am Larry, a crypto-quant.",
+                extra_model={"temperature": 0.55, "top_p": 0.8},
+            )
+            with patch("tools.delegate_tool.get_hermes_home", return_value=home), \
+                 patch("run_agent.AIAgent") as MockAgent:
+                mock_child = MagicMock()
+                mock_child.run_conversation.return_value = {
+                    "final_response": "ok", "completed": True, "api_calls": 1,
+                }
+                MockAgent.return_value = mock_child
+                delegate_task(goal="analyze BTC", parent_agent=parent, profile="larry")
+
+        _, kwargs = MockAgent.call_args
+        # Routing comes entirely from the profile.
+        self.assertEqual(kwargs["model"], "nvidia/nemotron-3-ultra")
+        self.assertEqual(kwargs["provider"], "openrouter")
+        self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(kwargs["api_mode"], "chat_completions")
+        # Persona is the primary identity, not an appended ephemeral.
+        self.assertEqual(kwargs["identity_override"], "I am Larry, a crypto-quant.")
+        # Reasoning effort from agent.reasoning_effort.
+        self.assertEqual(kwargs["reasoning_config"], parse_reasoning_effort("high"))
+        # Generation params ride on request_overrides.
+        self.assertEqual(kwargs["request_overrides"]["temperature"], 0.55)
+        self.assertEqual(kwargs["request_overrides"]["top_p"], 0.8)
+
+    def test_profile_soul_is_primary_identity_in_system_prompt(self):
+        """The profile SOUL must appear BEFORE the default identity, proving it
+        replaces (not appends to) the generic Hermes persona."""
+        from types import SimpleNamespace
+        from agent.system_prompt import build_system_prompt_parts, DEFAULT_AGENT_IDENTITY
+
+        # A bare MagicMock leaks MagicMock values into the volatile tier; use a
+        # plain namespace with only the attributes the builder reads.
+        agent = SimpleNamespace(
+            _identity_override="PROFILE-PERSONA-MARKER",
+            load_soul_identity=False,
+            skip_context_files=True,
+            valid_tool_names=[],
+            _tool_use_enforcement="auto",
+            model="",
+            provider="",
+            platform="",
+            _memory_store=None,
+            _memory_manager=None,
+            _user_profile_enabled=False,
+            _memory_enabled=False,
+            pass_session_id=False,
+            session_id=None,
+        )
+        parts = build_system_prompt_parts(agent)
+        stable = parts["stable"]
+        self.assertIn("PROFILE-PERSONA-MARKER", stable)
+        self.assertNotIn(DEFAULT_AGENT_IDENTITY, stable)
+        # Persona must be at the very top of the stable tier.
+        self.assertTrue(stable.lstrip().startswith("PROFILE-PERSONA-MARKER"))
+
+
 if __name__ == "__main__":
     unittest.main()
