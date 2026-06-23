@@ -414,6 +414,7 @@ class AIAgent:
         gateway_session_key: str = None,
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
+        identity_override: str = None,
         skip_memory: bool = False,
         session_db=None,
         parent_session_id: str = None,
@@ -489,6 +490,7 @@ class AIAgent:
             gateway_session_key=gateway_session_key,
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
+            identity_override=identity_override,
             skip_memory=skip_memory,
             session_db=session_db,
             parent_session_id=parent_session_id,
@@ -5236,6 +5238,7 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
+            profile=function_args.get("profile"),
             background=(not _is_subagent),
             parent_agent=self,
         )

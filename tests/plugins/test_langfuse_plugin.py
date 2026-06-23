@@ -236,6 +236,119 @@ class TestTraceScopeKey:
         assert plugin._trace_key("task-1", "session-1") == "task-1"
 
 
+class TestGenerationPayloads:
+    def _fresh_plugin(self):
+        mod_name = "plugins.observability.langfuse"
+        sys.modules.pop(mod_name, None)
+        return importlib.import_module(mod_name)
+
+    @staticmethod
+    def _fake_client(observations, updates):
+        class _Observation:
+            def update(self, **kw):
+                updates.append(kw)
+
+            def end(self, **kw):
+                pass
+
+        class _Span:
+            def update(self, **kw):
+                pass
+
+            def end(self, **kw):
+                pass
+
+            def set_trace_io(self, **kw):
+                pass
+
+            def start_observation(self, **kw):
+                observations.append(kw)
+                return _Observation()
+
+        class _RootCM:
+            def __enter__(self):
+                return _Span()
+
+            def __exit__(self, *exc):
+                return False
+
+        class _Client:
+            def create_trace_id(self, seed=None):
+                return f"trace::{seed}"
+
+            def start_as_current_observation(self, **kw):
+                return _RootCM()
+
+            def flush(self):
+                pass
+
+        return _Client()
+
+    def test_pre_llm_request_records_generation_parameters(self, monkeypatch):
+        mod = self._fresh_plugin()
+        observations = []
+        updates = []
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: self._fake_client(observations, updates))
+        mod._TRACE_STATE.clear()
+
+        mod.on_pre_llm_request(
+            task_id="task-params",
+            session_id="session-params",
+            model="nvidia/nemotron-3-ultra",
+            provider="openrouter",
+            api_mode="chat_completions",
+            api_call_count=1,
+            request_messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096,
+            temperature=0.55,
+            top_p=0.8,
+            turn_id="turn-params",
+            api_request_id="req-params",
+        )
+
+        assert observations
+        assert observations[0]["metadata"]["max_tokens"] == 4096
+        assert observations[0]["metadata"]["temperature"] == 0.55
+        assert observations[0]["metadata"]["top_p"] == 0.8
+        assert observations[0]["model_parameters"]["max_tokens"] == 4096
+        assert observations[0]["model_parameters"]["temperature"] == 0.55
+        assert observations[0]["model_parameters"]["top_p"] == 0.8
+
+    def test_post_llm_call_uses_assistant_reasoning_from_turn_finalizer(self, monkeypatch):
+        mod = self._fresh_plugin()
+        observations = []
+        updates = []
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: self._fake_client(observations, updates))
+        monkeypatch.setattr(mod, "_finish_trace", lambda *a, **k: None)
+        mod._TRACE_STATE.clear()
+
+        mod.on_pre_llm_request(
+            task_id="task-reasoning",
+            session_id="session-reasoning",
+            model="m",
+            provider="p",
+            api_mode="chat_completions",
+            api_call_count=1,
+            request_messages=[{"role": "user", "content": "hi"}],
+            turn_id="turn-reasoning",
+        )
+        mod.on_post_llm_call(
+            task_id="task-reasoning",
+            session_id="session-reasoning",
+            model="m",
+            provider="p",
+            api_mode="chat_completions",
+            api_call_count=1,
+            assistant_response="done",
+            assistant_reasoning="same-turn reasoning",
+            turn_id="turn-reasoning",
+        )
+
+        assert updates
+        assert updates[0]["output"]["content"] == "done"
+        assert updates[0]["output"]["reasoning"] == "same-turn reasoning"
+
+
 # ---------------------------------------------------------------------------
 # End-to-end collision regression: two turns of ONE gateway session must not
 # share trace state.  The helper-level tests above prove _trace_key returns

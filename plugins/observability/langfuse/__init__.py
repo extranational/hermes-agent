@@ -841,6 +841,8 @@ def on_pre_llm_request(
     approx_input_tokens: int = 0,
     request_char_count: int = 0,
     max_tokens: Any = None,
+    temperature: Any = None,
+    top_p: Any = None,
     conversation_history: Any = None,
     user_message: Any = None,
     turn_id: str = "",
@@ -865,6 +867,24 @@ def on_pre_llm_request(
         api_request_id=api_request_id,
     )
     req_key = _request_key(api_call_count)
+    generation_params: Dict[str, Any] = {
+        "api_mode": api_mode,
+        "provider": provider,
+    }
+    generation_metadata: Dict[str, Any] = {
+        "provider": provider,
+        "platform": platform,
+        "api_mode": api_mode,
+        "base_url": base_url,
+    }
+    for key, value in (
+        ("temperature", temperature),
+        ("top_p", top_p),
+        ("max_tokens", max_tokens),
+    ):
+        if value is not None:
+            generation_params[key] = value
+            generation_metadata[key] = value
 
     with _STATE_LOCK:
         state = _TRACE_STATE.get(task_key)
@@ -894,14 +914,9 @@ def on_pre_llm_request(
             name=f"LLM call {api_call_count}",
             as_type="generation",
             input_value=_serialize_messages(input_messages),
-            metadata={
-                "provider": provider,
-                "platform": platform,
-                "api_mode": api_mode,
-                "base_url": base_url,
-            },
+            metadata=generation_metadata,
             model=model,
-            model_parameters={"api_mode": api_mode, "provider": provider},
+            model_parameters=generation_params,
         )
 
 
@@ -911,6 +926,7 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                      api_duration: float = 0.0, finish_reason: str = "",
                      usage: Any = None, assistant_content_chars: int = 0,
                      assistant_tool_call_count: int = 0, assistant_response: Any = None,
+                     assistant_reasoning: Any = None,
                      turn_id: str = "", api_request_id: str = "",
                      **_: Any) -> None:
     client = _get_langfuse()
@@ -938,12 +954,16 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
         output = _serialize_assistant_message(assistant_message)
     elif assistant_response is not None:
         # post_llm_call passes assistant_response as a plain string
-        output = {"content": _safe_value(assistant_response), "reasoning": None, "tool_calls": []}
+        output = {
+            "content": _safe_value(assistant_response),
+            "reasoning": _safe_value(assistant_reasoning),
+            "tool_calls": [],
+        }
     else:
         # post_api_request path — reconstruct from summary kwargs
         output = {
             "content": f"[{assistant_content_chars} chars]" if assistant_content_chars else None,
-            "reasoning": None,
+            "reasoning": _safe_value(assistant_reasoning),
             "tool_calls": [{"id": f"tc_{i}"} for i in range(assistant_tool_call_count)] if assistant_tool_call_count else [],
         }
 

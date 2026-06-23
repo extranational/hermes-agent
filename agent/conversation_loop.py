@@ -1082,6 +1082,8 @@ def run_conversation(
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
                             max_tokens=agent.max_tokens,
+                            temperature=api_kwargs.get("temperature"),
+                            top_p=api_kwargs.get("top_p"),
                             started_at=api_start_time,
                             middleware_trace=list(_llm_middleware_trace),
                             request=_request_payload,

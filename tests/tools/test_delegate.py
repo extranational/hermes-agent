@@ -69,6 +69,7 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
+        self.assertIn("profile", props)
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
@@ -1997,12 +1998,188 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
 
 
+class TestProfileDelegation(unittest.TestCase):
+    """delegate_task(profile=...) applies the named profile's routing and identity."""
+
+    def _write_profile(
+        self,
+        home,
+        name,
+        *,
+        soul="I am Larry.",
+        extra_model=None,
+        reasoning_effort="high",
+    ):
+        import yaml
+
+        prof_dir = home / "profiles" / name
+        prof_dir.mkdir(parents=True, exist_ok=True)
+        model_block = {
+            "default": "nvidia/nemotron-3-ultra",
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+        if extra_model:
+            model_block.update(extra_model)
+        cfg = {"model": model_block, "agent": {"reasoning_effort": reasoning_effort}}
+        (prof_dir / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        (prof_dir / "SOUL.md").write_text(soul, encoding="utf-8")
+        return prof_dir
+
+    def test_load_profile_config_extracts_model_and_generation_fields(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            self._write_profile(
+                home,
+                "larry",
+                extra_model={"temperature": 0.7, "top_p": 0.9, "max_tokens": 4096},
+            )
+            with patch("tools.delegate_tool.get_hermes_home", return_value=home):
+                from tools import delegate_tool
+
+                cfg = delegate_tool._load_profile_config("larry")
+
+        self.assertEqual(cfg["model"], "nvidia/nemotron-3-ultra")
+        self.assertEqual(cfg["provider"], "openrouter")
+        self.assertEqual(cfg["api_mode"], "chat_completions")
+        self.assertEqual(cfg["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(cfg["temperature"], 0.7)
+        self.assertEqual(cfg["top_p"], 0.9)
+        self.assertEqual(cfg["max_tokens"], 4096)
+        self.assertEqual(cfg["reasoning_effort"], "high")
+        self.assertEqual(cfg["identity"], "I am Larry.")
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 50})
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("run_agent.AIAgent")
+    def test_profile_routes_settings_to_child(self, MockAgent, mock_run, _mock_cfg):
+        import tempfile
+        from pathlib import Path
+        from hermes_constants import parse_reasoning_effort
+
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.request_overrides = {"service_tier": "priority"}
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            self._write_profile(
+                home,
+                "larry",
+                soul="I am Larry, a crypto-quant.",
+                extra_model={"temperature": 0.55, "top_p": 0.8, "max_tokens": 4096},
+            )
+            with patch("tools.delegate_tool.get_hermes_home", return_value=home):
+                MockAgent.return_value = MagicMock()
+                delegate_task(goal="analyze BTC", parent_agent=parent, profile="larry")
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["model"], "nvidia/nemotron-3-ultra")
+        self.assertEqual(kwargs["provider"], "openrouter")
+        self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(kwargs["api_mode"], "chat_completions")
+        self.assertEqual(kwargs["max_tokens"], 4096)
+        self.assertEqual(kwargs["identity_override"], "I am Larry, a crypto-quant.")
+        self.assertEqual(kwargs["reasoning_config"], parse_reasoning_effort("high"))
+        self.assertEqual(kwargs["request_overrides"]["temperature"], 0.55)
+        self.assertEqual(kwargs["request_overrides"]["top_p"], 0.8)
+        self.assertEqual(kwargs["request_overrides"]["service_tier"], "priority")
+
+    def test_profile_soul_is_primary_identity_in_system_prompt(self):
+        from types import SimpleNamespace
+
+        from agent.system_prompt import DEFAULT_AGENT_IDENTITY, build_system_prompt_parts
+
+        agent = SimpleNamespace(
+            _identity_override="PROFILE-PERSONA-MARKER",
+            load_soul_identity=False,
+            skip_context_files=True,
+            valid_tool_names=[],
+            _tool_use_enforcement="auto",
+            _task_completion_guidance=True,
+            _parallel_tool_call_guidance=True,
+            _kanban_worker_guidance=None,
+            _platform_hint_overrides={},
+            model="",
+            provider="",
+            platform="",
+            _memory_store=None,
+            _memory_manager=None,
+            _user_profile_enabled=False,
+            _memory_enabled=False,
+            pass_session_id=False,
+            session_id=None,
+        )
+
+        stable = build_system_prompt_parts(agent)["stable"]
+        self.assertIn("PROFILE-PERSONA-MARKER", stable)
+        self.assertNotIn(DEFAULT_AGENT_IDENTITY, stable)
+        self.assertTrue(stable.lstrip().startswith("PROFILE-PERSONA-MARKER"))
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 50})
+    @patch("tools.async_delegation.dispatch_async_delegation_batch")
+    @patch("run_agent.AIAgent")
+    def test_profile_can_dispatch_in_background(self, MockAgent, mock_dispatch, _mock_cfg):
+        import tempfile
+        from pathlib import Path
+
+        mock_dispatch.return_value = {
+            "status": "dispatched",
+            "delegation_id": "dg-profile",
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.request_overrides = {}
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            self._write_profile(home, "larry")
+            with patch("tools.delegate_tool.get_hermes_home", return_value=home):
+                MockAgent.return_value = MagicMock()
+                result = json.loads(
+                    delegate_task(
+                        goal="background profile task",
+                        parent_agent=parent,
+                        profile="larry",
+                        background=True,
+                    )
+                )
+
+        self.assertEqual(result["status"], "dispatched")
+        self.assertEqual(result["mode"], "background")
+        self.assertEqual(result["delegation_id"], "dg-profile")
+        mock_dispatch.assert_called_once()
+
+
 # =========================================================================
 # Dispatch helper, progress events, concurrency
 # =========================================================================
 
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
+
+    def test_profile_forwarded_by_agent_dispatch_helper(self):
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        agent._delegate_depth = 0
+        with patch("tools.delegate_tool.delegate_task", return_value='{"ok": true}') as mock_delegate:
+            result = agent._dispatch_delegate_task(
+                {"goal": "test", "profile": "larry", "background": False}
+            )
+
+        self.assertEqual(result, '{"ok": true}')
+        self.assertEqual(mock_delegate.call_args.kwargs["profile"], "larry")
+        self.assertIs(mock_delegate.call_args.kwargs["background"], True)
 
     @patch("tools.delegate_tool._load_config", return_value={})
     @patch("tools.delegate_tool._resolve_delegation_credentials")

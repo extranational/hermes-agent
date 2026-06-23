@@ -151,7 +151,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
-    if agent.load_soul_identity or not agent.skip_context_files:
+    _identity_override = getattr(agent, "_identity_override", None)
+    if _identity_override and str(_identity_override).strip():
+        stable_parts.append(str(_identity_override).strip())
+        _soul_loaded = True
+    elif agent.load_soul_identity or not agent.skip_context_files:
         _soul_content = _r.load_soul_md(_ctx_len)
         if _soul_content:
             stable_parts.append(_soul_content)
