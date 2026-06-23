@@ -28,6 +28,7 @@ from tools.delegate_tool import (
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _extract_output_tail,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -68,6 +69,7 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
+        self.assertIn("profile", props)
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
@@ -498,7 +500,7 @@ class TestToolNamePreservation(unittest.TestCase):
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
 
-            def capture_and_return(user_message, task_id=None):
+            def capture_and_return(user_message, task_id=None, stream_callback=None):
                 captured["saved"] = list(mock_child._delegate_saved_tool_names)
                 return {"final_response": "ok", "completed": True, "api_calls": 1}
 
@@ -553,6 +555,71 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertIn("args_bytes", entry["tool_trace"][0])
             self.assertIn("result_bytes", entry["tool_trace"][0])
             self.assertEqual(entry["tool_trace"][0]["status"], "ok")
+
+    def test_tool_trace_handles_list_content_blocks(self):
+        """Tool-result content blocks should not crash observability metadata."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_1", "function": {"name": "image_generate", "arguments": '{"prompt": "x"}'}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "tc_1", "content": [
+                        {"type": "text", "text": '{"success": true}'},
+                    ]},
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test list content", parent_agent=parent))
+            trace = result["results"][0]["tool_trace"]
+            self.assertEqual(trace[0]["tool"], "image_generate")
+            self.assertEqual(trace[0]["status"], "ok")
+            self.assertGreater(trace[0]["result_bytes"], 0)
+
+    def test_output_tail_flattens_list_content_blocks(self):
+        """_extract_output_tail (live overlay) must flatten content-block lists
+        so error markers buried inside blocks are detected and previews are
+        real text, not a "[{'type': 'text'...}]" repr blob."""
+        result = {
+            "messages": [
+                {"role": "assistant", "tool_calls": [
+                    {"id": "t1", "function": {"name": "terminal", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "t1", "content": [
+                    {"type": "text", "text": "Error: command not found"},
+                ]},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "t2", "function": {"name": "vision", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "t2", "content": [
+                    {"type": "text", "text": "all good"},
+                    {"type": "image_url", "image_url": {"url": "data:x"}},
+                ]},
+            ]
+        }
+        tail = _extract_output_tail(result, max_entries=8, max_chars=600)
+        by_tool = {t["tool"]: t for t in tail}
+
+        # Block-wrapped error is correctly flagged (crude str() would miss it).
+        self.assertTrue(by_tool["terminal"]["is_error"])
+        self.assertEqual(by_tool["terminal"]["preview"], "Error: command not found")
+        # Non-error multimodal result is not flagged, and the text is readable.
+        self.assertFalse(by_tool["vision"]["is_error"])
+        self.assertIn("all good", by_tool["vision"]["preview"])
+        # No raw content-block repr leaked into any preview.
+        for entry in tail:
+            self.assertNotIn("'type'", entry["preview"])
 
     def test_tool_trace_detects_error(self):
         """Tool results containing 'error' should be marked as error status."""
@@ -838,14 +905,13 @@ class TestBlockedTools(unittest.TestCase):
     def test_constants(self):
         from tools.delegate_tool import (
             _get_max_spawn_depth, _get_orchestrator_enabled,
-            _MIN_SPAWN_DEPTH, _MAX_SPAWN_DEPTH_CAP,
+            _MIN_SPAWN_DEPTH,
         )
         self.assertEqual(_get_max_concurrent_children(), 3)
         self.assertEqual(MAX_DEPTH, 1)
         self.assertEqual(_get_max_spawn_depth(), 1)       # default: flat
         self.assertTrue(_get_orchestrator_enabled())      # default
         self.assertEqual(_MIN_SPAWN_DEPTH, 1)
-        self.assertEqual(_MAX_SPAWN_DEPTH_CAP, 3)
 
 
 class TestDelegationCredentialResolution(unittest.TestCase):
@@ -1453,6 +1519,73 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    # --- Custom-endpoint identity resolution (issue #7833) ---
+
+    def test_custom_different_endpoint_does_not_inherit_parent_pool(self):
+        """A child on custom endpoint B must not inherit the parent's custom
+        endpoint A pool just because both normalize to provider='custom'."""
+        parent = _make_mock_parent()
+        parent.provider = "custom"
+        parent.base_url = "https://endpoint-a.example.com/v1"
+        parent._credential_pool = MagicMock(name="parent_custom_a_pool")
+
+        child_pool = MagicMock(name="endpoint_b_pool")
+        child_pool.has_credentials.return_value = True
+
+        def fake_key(base_url, provider_name=None):
+            return {
+                "https://endpoint-a.example.com/v1": "custom:endpoint-a",
+                "https://endpoint-b.example.com/v1": "custom:endpoint-b",
+            }.get(base_url)
+
+        with patch("agent.credential_pool.get_custom_provider_pool_key", side_effect=fake_key), \
+             patch("agent.credential_pool.load_pool", return_value=child_pool) as load_mock:
+            result = _resolve_child_credential_pool(
+                "custom", parent, "https://endpoint-b.example.com/v1"
+            )
+
+        # Loaded the child's OWN endpoint pool, not the parent's.
+        load_mock.assert_called_once_with("custom:endpoint-b")
+        self.assertIs(result, child_pool)
+        self.assertIsNot(result, parent._credential_pool)
+
+    def test_custom_same_endpoint_shares_parent_pool(self):
+        """A child on the SAME custom endpoint as the parent reuses the parent's
+        pool so rotation/cooldown state stays synchronized."""
+        parent = _make_mock_parent()
+        parent.provider = "custom"
+        parent.base_url = "https://endpoint-a.example.com/v1"
+        parent._credential_pool = MagicMock(name="parent_custom_a_pool")
+
+        with patch(
+            "agent.credential_pool.get_custom_provider_pool_key",
+            return_value="custom:endpoint-a",
+        ):
+            result = _resolve_child_credential_pool(
+                "custom", parent, "https://endpoint-a.example.com/v1"
+            )
+
+        self.assertIs(result, parent._credential_pool)
+
+    def test_custom_unregistered_endpoint_returns_none(self):
+        """A raw delegation.base_url with no matching custom_providers entry
+        must NOT inherit the parent's pool — return None so the child keeps its
+        fixed delegated credential."""
+        parent = _make_mock_parent()
+        parent.provider = "custom"
+        parent.base_url = "https://endpoint-a.example.com/v1"
+        parent._credential_pool = MagicMock(name="parent_custom_a_pool")
+
+        with patch(
+            "agent.credential_pool.get_custom_provider_pool_key",
+            return_value=None,
+        ):
+            result = _resolve_child_credential_pool(
+                "custom", parent, "https://raw-unregistered.example.com/v1"
+            )
+
+        self.assertIsNone(result)
+
     def test_build_child_agent_assigns_parent_pool_when_shared(self):
         parent = _make_mock_parent()
         mock_pool = MagicMock()
@@ -1865,12 +1998,188 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
 
 
+class TestProfileDelegation(unittest.TestCase):
+    """delegate_task(profile=...) applies the named profile's routing and identity."""
+
+    def _write_profile(
+        self,
+        home,
+        name,
+        *,
+        soul="I am Larry.",
+        extra_model=None,
+        reasoning_effort="high",
+    ):
+        import yaml
+
+        prof_dir = home / "profiles" / name
+        prof_dir.mkdir(parents=True, exist_ok=True)
+        model_block = {
+            "default": "nvidia/nemotron-3-ultra",
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+        if extra_model:
+            model_block.update(extra_model)
+        cfg = {"model": model_block, "agent": {"reasoning_effort": reasoning_effort}}
+        (prof_dir / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        (prof_dir / "SOUL.md").write_text(soul, encoding="utf-8")
+        return prof_dir
+
+    def test_load_profile_config_extracts_model_and_generation_fields(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            self._write_profile(
+                home,
+                "larry",
+                extra_model={"temperature": 0.7, "top_p": 0.9, "max_tokens": 4096},
+            )
+            with patch("tools.delegate_tool.get_hermes_home", return_value=home):
+                from tools import delegate_tool
+
+                cfg = delegate_tool._load_profile_config("larry")
+
+        self.assertEqual(cfg["model"], "nvidia/nemotron-3-ultra")
+        self.assertEqual(cfg["provider"], "openrouter")
+        self.assertEqual(cfg["api_mode"], "chat_completions")
+        self.assertEqual(cfg["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(cfg["temperature"], 0.7)
+        self.assertEqual(cfg["top_p"], 0.9)
+        self.assertEqual(cfg["max_tokens"], 4096)
+        self.assertEqual(cfg["reasoning_effort"], "high")
+        self.assertEqual(cfg["identity"], "I am Larry.")
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 50})
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("run_agent.AIAgent")
+    def test_profile_routes_settings_to_child(self, MockAgent, mock_run, _mock_cfg):
+        import tempfile
+        from pathlib import Path
+        from hermes_constants import parse_reasoning_effort
+
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.request_overrides = {"service_tier": "priority"}
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            self._write_profile(
+                home,
+                "larry",
+                soul="I am Larry, a crypto-quant.",
+                extra_model={"temperature": 0.55, "top_p": 0.8, "max_tokens": 4096},
+            )
+            with patch("tools.delegate_tool.get_hermes_home", return_value=home):
+                MockAgent.return_value = MagicMock()
+                delegate_task(goal="analyze BTC", parent_agent=parent, profile="larry")
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["model"], "nvidia/nemotron-3-ultra")
+        self.assertEqual(kwargs["provider"], "openrouter")
+        self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(kwargs["api_mode"], "chat_completions")
+        self.assertEqual(kwargs["max_tokens"], 4096)
+        self.assertEqual(kwargs["identity_override"], "I am Larry, a crypto-quant.")
+        self.assertEqual(kwargs["reasoning_config"], parse_reasoning_effort("high"))
+        self.assertEqual(kwargs["request_overrides"]["temperature"], 0.55)
+        self.assertEqual(kwargs["request_overrides"]["top_p"], 0.8)
+        self.assertEqual(kwargs["request_overrides"]["service_tier"], "priority")
+
+    def test_profile_soul_is_primary_identity_in_system_prompt(self):
+        from types import SimpleNamespace
+
+        from agent.system_prompt import DEFAULT_AGENT_IDENTITY, build_system_prompt_parts
+
+        agent = SimpleNamespace(
+            _identity_override="PROFILE-PERSONA-MARKER",
+            load_soul_identity=False,
+            skip_context_files=True,
+            valid_tool_names=[],
+            _tool_use_enforcement="auto",
+            _task_completion_guidance=True,
+            _parallel_tool_call_guidance=True,
+            _kanban_worker_guidance=None,
+            _platform_hint_overrides={},
+            model="",
+            provider="",
+            platform="",
+            _memory_store=None,
+            _memory_manager=None,
+            _user_profile_enabled=False,
+            _memory_enabled=False,
+            pass_session_id=False,
+            session_id=None,
+        )
+
+        stable = build_system_prompt_parts(agent)["stable"]
+        self.assertIn("PROFILE-PERSONA-MARKER", stable)
+        self.assertNotIn(DEFAULT_AGENT_IDENTITY, stable)
+        self.assertTrue(stable.lstrip().startswith("PROFILE-PERSONA-MARKER"))
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 50})
+    @patch("tools.async_delegation.dispatch_async_delegation_batch")
+    @patch("run_agent.AIAgent")
+    def test_profile_can_dispatch_in_background(self, MockAgent, mock_dispatch, _mock_cfg):
+        import tempfile
+        from pathlib import Path
+
+        mock_dispatch.return_value = {
+            "status": "dispatched",
+            "delegation_id": "dg-profile",
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.request_overrides = {}
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            self._write_profile(home, "larry")
+            with patch("tools.delegate_tool.get_hermes_home", return_value=home):
+                MockAgent.return_value = MagicMock()
+                result = json.loads(
+                    delegate_task(
+                        goal="background profile task",
+                        parent_agent=parent,
+                        profile="larry",
+                        background=True,
+                    )
+                )
+
+        self.assertEqual(result["status"], "dispatched")
+        self.assertEqual(result["mode"], "background")
+        self.assertEqual(result["delegation_id"], "dg-profile")
+        mock_dispatch.assert_called_once()
+
+
 # =========================================================================
 # Dispatch helper, progress events, concurrency
 # =========================================================================
 
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
+
+    def test_profile_forwarded_by_agent_dispatch_helper(self):
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        agent._delegate_depth = 0
+        with patch("tools.delegate_tool.delegate_task", return_value='{"ok": true}') as mock_delegate:
+            result = agent._dispatch_delegate_task(
+                {"goal": "test", "profile": "larry", "background": False}
+            )
+
+        self.assertEqual(result, '{"ok": true}')
+        self.assertEqual(mock_delegate.call_args.kwargs["profile"], "larry")
+        self.assertIs(mock_delegate.call_args.kwargs["background"], True)
 
     @patch("tools.delegate_tool._load_config", return_value={})
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -2084,17 +2393,14 @@ class TestMaxSpawnDepth(unittest.TestCase):
         with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
             result = _get_max_spawn_depth()
         self.assertEqual(result, 1)
-        self.assertTrue(any("clamping to 1" in m for m in cm.output))
+        self.assertTrue(any("below floor 1" in m for m in cm.output))
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 99})
-    def test_max_spawn_depth_clamped_above_three(self, mock_cfg):
-        import logging
+    def test_max_spawn_depth_no_upper_ceiling(self, mock_cfg):
+        """No upper ceiling — high values pass through unchanged (cost is the limiter)."""
         from tools.delegate_tool import _get_max_spawn_depth
-        with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
-            result = _get_max_spawn_depth()
-        self.assertEqual(result, 3)
-        self.assertTrue(any("clamping to 3" in m for m in cm.output))
+        self.assertEqual(_get_max_spawn_depth(), 99)
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": "not-a-number"})
@@ -2487,7 +2793,7 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
                 m.thinking_callback = None
                 orch_mock["agent"] = m
 
-                def _orchestrator_run(user_message=None, task_id=None):
+                def _orchestrator_run(user_message=None, task_id=None, stream_callback=None):
                     # Re-entrant: orchestrator spawns two leaves
                     delegate_task(
                         tasks=[{"goal": "leaf-A"}, {"goal": "leaf-B"}],
